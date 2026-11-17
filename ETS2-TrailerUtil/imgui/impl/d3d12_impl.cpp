@@ -28,7 +28,7 @@ struct FrameContext
 static int const NUM_FRAMES_IN_FLIGHT = 3;
 FrameContext* g_frameContext;
 static UINT g_frameIndex = 0;
-static UINT g_fenceValue = 0;
+static UINT64 g_fenceValue = 0;
 
 static int NUM_BACK_BUFFERS = -1;
 static ID3D12CommandQueue* g_pd3dCommandQueue = nullptr;
@@ -64,14 +64,14 @@ void CreateRenderTarget()
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_pd3dRtvDescHeap->GetCPUDescriptorHandleForHeapStart();
 
     // First, initialize the descriptors
-    for (UINT i = 0; i < NUM_BACK_BUFFERS; i++)
+    for (UINT i = 0; i < (UINT)NUM_BACK_BUFFERS; i++)
     {
         g_frameContext[i].g_mainRenderTargetDescriptor = rtvHandle;
         rtvHandle.ptr += rtvDescriptorSize;
     }
 
     // Then we create Render Target Views
-    for (UINT i = 0; i < NUM_BACK_BUFFERS; i++)
+    for (UINT i = 0; i < (UINT)NUM_BACK_BUFFERS; i++)
     {
         ID3D12Resource* pBackBuffer = nullptr;
         if (SUCCEEDED(g_pSwapChain->GetBuffer(i, IID_PPV_ARGS(&pBackBuffer))))
@@ -110,7 +110,7 @@ void CleanupRenderTarget()
 {
     if (g_frameContext && NUM_BACK_BUFFERS > 0)
     {
-        for (UINT i = 0; i < NUM_BACK_BUFFERS; i++)
+        for (UINT i = 0; i < (UINT)NUM_BACK_BUFFERS; i++)
         {
             if (g_frameContext[i].g_mainRenderTargetResource)
             {
@@ -200,7 +200,7 @@ HRESULT __fastcall hkPresent(IDXGISwapChain3* pSwapChain, UINT SyncInterval, UIN
                 return oPresent(pSwapChain, SyncInterval, Flags);
             }
 
-            for (UINT i = 0; i < NUM_BACK_BUFFERS; i++)
+            for (UINT i = 0; i < (UINT)NUM_BACK_BUFFERS; i++)
             {
                 g_frameContext[i].CommandAllocator = allocator;
                 g_frameContext[i].FenceValue = 0;

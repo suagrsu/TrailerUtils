@@ -77,7 +77,7 @@ BOOL WINAPI hkWglSwapBuffers(HDC hdc)
     {
         glewInit();
 
-        HWND hwnd = WindowFromDC(wglGetCurrentDC ? (HDC)wglGetCurrentDC() : nullptr);
+        HWND hwnd = WindowFromDC(wglGetCurrentDC());
 
         impl::win32::init(hwnd);
 

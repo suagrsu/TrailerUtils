@@ -13,6 +13,7 @@
 #include "bmem.h"
 #include "scs_logging.h"
 #include "prism/prism.h"
+#include "game_profiles.h"
 
 #include "launch_arguments_manager.h"
 
@@ -37,6 +38,48 @@ std::vector<prism::game_trailer_actor_u*> temp_locked_trailers;
 
 uintptr_t game_ctrl_ptr;
 uint32_t game_actor_offset;
+
+// 当前匹配到的游戏版本配置（见 game_profiles.h）
+const gamecfg::GameProfile* active_profile = nullptr;
+// 挂车对象相对 game_actor 的偏移，运行时由 active_profile 决定（旧代码硬编码 0xC0/0xC8）
+uint32_t trailer_actor_offset = 0xC0;
+uint32_t trailer_actor_offset_render = 0xC8;
+
+// 挂车对象内部字段偏移，运行时由 active_profile 填充。
+// 用这些偏移做动态访问，使同一份 DLL 能支持布局不同的多个游戏版本。
+uint32_t off_steering = 0x640;
+uint32_t off_steering_data = 0x648;
+uint32_t off_hook_joint = 0xF68;
+uint32_t off_slave = 0x1010;
+
+// ---- 按运行时偏移访问挂车字段（替代编译期结构体的 -> 访问）----
+template <typename T>
+inline T& field_at(void* base, uint32_t offset) {
+    return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(base) + offset);
+}
+inline float& f_steering(void* a)        { return field_at<float>(a, off_steering); }
+inline prism::steering_data_t*& f_steerdata(void* a) {
+    return field_at<prism::steering_data_t*>(a, off_steering_data);
+}
+inline prism::physics_joint_physx_t*& f_hookjoint(void* a) {
+    return field_at<prism::physics_joint_physx_t*>(a, off_hook_joint);
+}
+inline prism::game_trailer_actor_u*& f_slave(void* a) {
+    return field_at<prism::game_trailer_actor_u*>(a, off_slave);
+}
+
+// 挂车指针有效性校验：防止错误的字段偏移导致野指针解引用而崩溃游戏。
+// 只做轻量检查：非空、未对齐到明显非法值、前若干字节可读。
+inline bool is_valid_trailer(const void* p) {
+    if (p == nullptr) return false;
+    uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    if (v < 0x10000) return false;                 // 明显非法的小地址
+    if (IsBadReadPtr(p, sizeof(void*) * 4)) return false; // 内存不可读
+    return true;
+}
+
+// 挂车链最大遍历数，防止偏移错误时沿野链无限循环
+constexpr int MAX_TRAILERS = 16;
 
 bool is_fatal_error = false;
 std::string error = "";
@@ -155,7 +198,7 @@ bool isTrailerTempLocked(prism::game_trailer_actor_u* trailer)
 
 bool isTrailerSteerable(prism::game_trailer_actor_u* trailer)
 {
-    return trailer->steering_data != nullptr;
+    return f_steerdata(trailer) != nullptr;
 }
 
 void render_error(std::string message) {
@@ -172,7 +215,7 @@ void render_fatal(std::string message) {
 
     if (ImGui::Button("Get Help!"))
     {
-        ShellExecuteA(NULL, "open", "https://discord.gg/insanux", NULL, NULL, SW_SHOWNORMAL);
+        ShellExecuteA(NULL, "open", "https://github.com/suagrsu/TrailerUtils", NULL, NULL, SW_SHOWNORMAL);
     }
 
     ImGui::Spacing();
@@ -195,7 +238,7 @@ void render_fatal(std::string message) {
             ImGui::TextWrapped("game_actor: %p", game_actor);
 
             if (game_actor) {
-                uint8_t* trailer_actor = *(uint8_t**)(game_actor + 0xc0);
+                uint8_t* trailer_actor = *(uint8_t**)(game_actor + trailer_actor_offset);
                 ImGui::TextWrapped("trailer_actor: %p", trailer_actor);
 
 
@@ -227,6 +270,7 @@ struct input_device
     LPDIRECTINPUTDEVICE8 di8_device;
     std::unordered_map<std::string, float> joystates;
     DIJOYSTATE2 joystate;
+    bool is_keyboard = false; // 虚拟键盘设备：用 GetAsyncKeyState 而非 DirectInput
 };
 std::vector<input_device> input_devices;
 
@@ -244,6 +288,11 @@ std::string last_steer_left_button_name = "None";
 std::string steer_right_button_name = "None";
 std::string last_steer_right_button_name = "None";
 
+// 切换手动/自动控制(Lock the steering position)的按键
+std::string toggle_lock_button_name = "None";
+std::string last_toggle_lock_button_name = "None";
+bool toggle_lock_key_was_down = false; // 边沿触发：防止按住键时反复切换
+
 int current_controlled_trailer = 0; // the trailer you are currently controlling
 int last_current_controlled_trailer = 0;
 
@@ -252,9 +301,56 @@ bool last_use_axis_steering = false;
 bool use_button_steering = false;
 bool last_use_button_steering = false;
 
+// 键盘虚拟键码 -> 友好名称（用于菜单显示）
+static std::string vk_name(int vk)
+{
+    if (vk >= 'A' && vk <= 'Z') return std::string(1, (char)vk);
+    if (vk >= '0' && vk <= '9') return std::string(1, (char)vk);
+    if (vk >= VK_F1 && vk <= VK_F12) return "F" + std::to_string(vk - VK_F1 + 1);
+    switch (vk) {
+        case VK_SPACE:    return "Space";
+        case VK_SHIFT:    return "Shift";
+        case VK_LSHIFT:   return "L-Shift";
+        case VK_RSHIFT:   return "R-Shift";
+        case VK_CONTROL:  return "Ctrl";
+        case VK_LCONTROL: return "L-Ctrl";
+        case VK_RCONTROL: return "R-Ctrl";
+        case VK_MENU:     return "Alt";
+        case VK_LEFT:     return "Left";
+        case VK_RIGHT:    return "Right";
+        case VK_UP:       return "Up";
+        case VK_DOWN:     return "Down";
+        case VK_RETURN:   return "Enter";
+        case VK_TAB:      return "Tab";
+        case VK_BACK:     return "Backspace";
+        case VK_ESCAPE:   return "Esc";
+        default:          return "VK" + std::to_string(vk);
+    }
+}
+
+// 键名字符串 -> 显示名（键盘用 "K<vk>" 前缀存储，手柄用纯数字索引）
+static std::string key_display_name(const std::string& key)
+{
+    if (key.size() > 1 && key[0] == 'K' && isdigit((unsigned char)key[1]))
+        return vk_name(std::atoi(key.c_str() + 1));
+    return key;
+}
+
 std::string get_next_button_input(int device_index)
 {
     input_device& device = input_devices[device_index];
+
+    if (device.is_keyboard)
+    {
+        // 扫描常用虚拟键码（排除鼠标键），返回 "K<vk>" 形式
+        for (int vk = 0x08; vk <= 0xFE; ++vk)
+        {
+            if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
+            if (GetAsyncKeyState(vk) & 0x8000)
+                return "K" + std::to_string(vk);
+        }
+        return "";
+    }
 
     for (int i = 0; i < 128; ++i)
         if (device.joystate.rgbButtons[i] & 0x80)
@@ -352,6 +448,10 @@ std::string get_button_name_logi(std::string index)
 std::string get_button_name(int device_index, std::string key)
 {
     input_device& device = input_devices[device_index];
+
+    // 键盘设备：直接显示友好键名
+    if (device.is_keyboard)
+        return key_display_name(key);
 
     std::string name = device.name;
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -507,13 +607,16 @@ void render_keybinds()
         {
             static bool want_left_button_input = false;
             static bool want_right_button_input = false;
+            static bool want_toggle_lock_input = false;
 
             std::string steer_left_text = steer_left_button_name;
             std::string steer_right_text = steer_right_button_name;
+            std::string toggle_lock_text = toggle_lock_button_name;
 
             if (want_left_button_input)
             {
                 want_right_button_input = false;
+                want_toggle_lock_input = false;
                 steer_left_text = "Press a key...";
                 std::string new_button = get_next_button_input(steer_button_device_index);
                 if (!new_button.empty())
@@ -521,6 +624,8 @@ void render_keybinds()
                     steer_left_button_name = new_button;
                     if (steer_left_button_name == steer_right_button_name)
                         steer_right_button_name = "None";
+                    if (steer_left_button_name == toggle_lock_button_name)
+                        toggle_lock_button_name = "None";
                     want_left_button_input = false;
                 }
             }
@@ -528,6 +633,7 @@ void render_keybinds()
             if (want_right_button_input)
             {
                 want_left_button_input = false;
+                want_toggle_lock_input = false;
                 steer_right_text = "Press a key...";
                 std::string new_button = get_next_button_input(steer_button_device_index);
                 if (!new_button.empty())
@@ -535,7 +641,26 @@ void render_keybinds()
                     steer_right_button_name = new_button;
                     if (steer_right_button_name == steer_left_button_name)
                         steer_left_button_name = "None";
+                    if (steer_right_button_name == toggle_lock_button_name)
+                        toggle_lock_button_name = "None";
                     want_right_button_input = false;
+                }
+            }
+
+            if (want_toggle_lock_input)
+            {
+                want_left_button_input = false;
+                want_right_button_input = false;
+                toggle_lock_text = "Press a key...";
+                std::string new_button = get_next_button_input(steer_button_device_index);
+                if (!new_button.empty())
+                {
+                    toggle_lock_button_name = new_button;
+                    if (toggle_lock_button_name == steer_left_button_name)
+                        steer_left_button_name = "None";
+                    if (toggle_lock_button_name == steer_right_button_name)
+                        steer_right_button_name = "None";
+                    want_toggle_lock_input = false;
                 }
             }
 
@@ -548,6 +673,13 @@ void render_keybinds()
                 want_right_button_input = !want_right_button_input;
 
             ImGui::SameLine(); ImGui::TextWrapped("Steer Right");
+
+            ImGui::Spacing();
+
+            if (ImGui::Button((get_button_name(steer_button_device_index, toggle_lock_text) + "##togglelock").c_str()))
+                want_toggle_lock_input = !want_toggle_lock_input;
+
+            ImGui::SameLine(); ImGui::TextWrapped("Toggle Manual/Auto (Lock steering)");
         }
     }
 
@@ -559,6 +691,7 @@ void render_keybinds()
         || steer_button_device_index != last_steer_button_device_index
         || steer_left_button_name != last_steer_left_button_name
         || steer_right_button_name != last_steer_right_button_name
+        || toggle_lock_button_name != last_toggle_lock_button_name
         || current_controlled_trailer != last_current_controlled_trailer
         || use_axis_steering != last_use_axis_steering
         || use_button_steering != last_use_button_steering
@@ -571,6 +704,7 @@ void render_keybinds()
             {"steer_button_device_index", steer_button_device_index},
             {"steer_left_button_name", steer_left_button_name},
             {"steer_right_button_name", steer_right_button_name},
+            {"toggle_lock_button_name", toggle_lock_button_name},
             {"current_controlled_trailer", current_controlled_trailer},
             {"use_axis_steering", use_axis_steering},
             {"use_button_steering", use_button_steering}
@@ -585,6 +719,7 @@ void render_keybinds()
         last_steer_button_device_index = steer_button_device_index;
         last_steer_left_button_name = steer_left_button_name;
         last_steer_right_button_name = steer_right_button_name;
+        last_toggle_lock_button_name = toggle_lock_button_name;
         last_current_controlled_trailer = current_controlled_trailer;
         last_use_axis_steering = use_axis_steering;
         last_use_button_steering = use_button_steering;
@@ -607,14 +742,14 @@ void render_trailers()
         uint8_t* game_actor = *(uint8_t**)(game_ctrl + game_actor_offset);
         if (game_actor)
         {
-            prism::game_trailer_actor_u* trailer_actor = *(prism::game_trailer_actor_u**)(game_actor + 0xc8);
+            prism::game_trailer_actor_u* trailer_actor = *(prism::game_trailer_actor_u**)(game_actor + trailer_actor_offset_render);
 
             if (trailer_actor)
             {
                 ImGui::Spacing();
 
                 int trailerIndex = 0;
-                while (trailer_actor != nullptr)
+                while (is_valid_trailer(trailer_actor) && trailerIndex < MAX_TRAILERS)
                 {
                     bool steerable = isTrailerSteerable(trailer_actor);
 
@@ -658,7 +793,7 @@ void render_trailers()
                         ImGui::SameLine();
                         ImGui::PushItemWidth(-1);
 
-                        ImGui::SliderFloat(("##Steering" + std::to_string(trailerIndex)).c_str(), &trailer_actor->steering, -1.f, 1.f);
+                        ImGui::SliderFloat(("##Steering" + std::to_string(trailerIndex)).c_str(), &f_steering(trailer_actor), -1.f, 1.f);
 
                         ImGui::PopItemWidth();
                         if (ImGui::IsItemActive())
@@ -685,20 +820,13 @@ void render_trailers()
 
                         ImGui::Spacing();
 
-                        ImGui::Text("Suspention Height: ");
-                        ImGui::PushItemWidth(-1);
-
-                        ImGui::SliderFloat(("##Suspention" + std::to_string(trailerIndex)).c_str(), &trailer_actor->suspention_height, 0.25f, 5.f);
-                        ImGui::PopItemWidth();
-
-
-                        ImGui::Spacing();
-
-                        if (trailer_actor->hook_joint)
+                        prism::physics_joint_physx_t* hook_joint = f_hookjoint(trailer_actor);
+                        // 校验 joint 及其内部 physx_joint 指针可读，避免野指针虚调用导致崩溃
+                        if (is_valid_trailer(hook_joint) && is_valid_trailer(hook_joint->physx_joint))
                         {
                             std::string joint = "unknown";
                             std::string btn_text = "Unsupported";
-                            switch (trailer_actor->hook_joint->physx_joint->GetMotion(prism::PxD6Axis::Enum::eTWIST))
+                            switch (hook_joint->physx_joint->GetMotion(prism::PxD6Axis::Enum::eTWIST))
                             {
                             case prism::PxD6Motion::Enum::eFREE:
                                 joint = "free";
@@ -719,11 +847,11 @@ void render_trailers()
                             {
                                 if (btn_text == "Lock")
                                 {
-                                    trailer_actor->hook_joint->physx_joint->SetMotion(prism::PxD6Axis::Enum::eTWIST, prism::PxD6Motion::Enum::eLOCKED);
+                                    hook_joint->physx_joint->SetMotion(prism::PxD6Axis::Enum::eTWIST, prism::PxD6Motion::Enum::eLOCKED);
                                 }
                                 else
                                 {
-                                    trailer_actor->hook_joint->physx_joint->SetMotion(prism::PxD6Axis::Enum::eTWIST, prism::PxD6Motion::Enum::eFREE);
+                                    hook_joint->physx_joint->SetMotion(prism::PxD6Axis::Enum::eTWIST, prism::PxD6Motion::Enum::eFREE);
                                 }
                             }
                         }
@@ -736,7 +864,7 @@ void render_trailers()
 
 
 
-                    trailer_actor = trailer_actor->slave;
+                    trailer_actor = f_slave(trailer_actor);
                     trailerIndex++;
                 }
             }
@@ -760,9 +888,10 @@ void render_about()
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::TextWrapped("Version: 1.0.5");
-    ImGui::TextWrapped("Supported Game Version: 1.60");
-    ImGui::TextWrapped("Author: Baldy09");
+    ImGui::TextWrapped("Version: 1.1.0");
+    ImGui::TextWrapped("Matched profile: %s", active_profile ? active_profile->label : "none");
+    ImGui::TextWrapped("Branch: SugarSu");
+    ImGui::TextWrapped("Original Author: Baldy09");
 
     ImGui::Spacing(); ImGui::Spacing();
 
@@ -794,22 +923,18 @@ void render_about()
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (ImGui::Button("Support My Work"))
+    if (ImGui::Button("Get Plugin Support"))
+    {
+        ShellExecuteA(NULL, "open", "https://github.com/suagrsu/TrailerUtils", NULL, NULL, SW_SHOWNORMAL);
+    }
+
+    ImGui::EndTabItem();    
+
+    if (ImGui::Button("Support Original Author"))
     {
         ShellExecuteA(NULL, "open", "https://www.paypal.com/paypalme/BaldyMods", NULL, NULL, SW_SHOWNORMAL);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Join My Discord"))
-    {
-        ShellExecuteA(NULL, "open", "https://discord.gg/NeggzRmHH7", NULL, NULL, SW_SHOWNORMAL);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Get Plugin Support"))
-    {
-        ShellExecuteA(NULL, "open", "https://discord.gg/insanux", NULL, NULL, SW_SHOWNORMAL);
-    }
-
-    ImGui::EndTabItem();
 }
 
 
@@ -878,6 +1003,8 @@ void dllmain::main_tick()
     // Update devices
     for (input_device& device : input_devices)
     {
+        if (device.is_keyboard) continue; // 键盘用 GetAsyncKeyState 实时读取，无需 Poll
+
         DIJOYSTATE2 joystate = {};
 
         HRESULT hr = device.di8_device->Poll();
@@ -947,17 +1074,38 @@ void dllmain::main_tick()
 
             if (game_actor)
             {
-                prism::game_trailer_actor_u* trailer_actor = *(prism::game_trailer_actor_u**)(game_actor + 0xC0);
+                prism::game_trailer_actor_u* trailer_actor = *(prism::game_trailer_actor_u**)(game_actor + trailer_actor_offset);
                 if (trailer_actor)
                 {
                     int trailerIndex = 0;
-                    while (trailer_actor != nullptr)
+                    while (is_valid_trailer(trailer_actor) && trailerIndex < MAX_TRAILERS)
                     {
                         if (trailerIndex == current_controlled_trailer)
                         {
                             if (use_button_steering && steer_button_device_index != -1)
                             {
                                 std::string pressed_key = get_next_button_input(steer_button_device_index);
+
+                                // Toggle Manual/Auto（边沿触发：只在按下的那一帧切换一次）
+                                bool toggle_down = (toggle_lock_button_name != "None"
+                                                    && pressed_key == toggle_lock_button_name);
+                                if (toggle_down && !toggle_lock_key_was_down)
+                                {
+                                    if (isTrailerLocked(trailer_actor))
+                                    {
+                                        locked_trailers.erase(
+                                            std::remove(locked_trailers.begin(), locked_trailers.end(), trailer_actor),
+                                            locked_trailers.end());
+                                        scs_log(0, "Trailer '%p' steering set to AUTO (unlocked)", trailer_actor);
+                                    }
+                                    else
+                                    {
+                                        locked_trailers.push_back(trailer_actor);
+                                        scs_log(0, "Trailer '%p' steering set to MANUAL (locked)", trailer_actor);
+                                    }
+                                }
+                                toggle_lock_key_was_down = toggle_down;
+
                                 if (pressed_key != "")
                                 {
                                     if (pressed_key == steer_left_button_name)
@@ -968,10 +1116,10 @@ void dllmain::main_tick()
                                             locked_trailers.push_back(trailer_actor);
                                         }
 
-                                        if (trailer_actor->steering - 0.01f < -1.f)
-                                            trailer_actor->steering = -1.f;
+                                        if (f_steering(trailer_actor) - 0.01f < -1.f)
+                                            f_steering(trailer_actor) = -1.f;
                                         else
-                                            trailer_actor->steering -= 0.01f;
+                                            f_steering(trailer_actor) -= 0.01f;
                                     }
 
                                     if (pressed_key == steer_right_button_name)
@@ -982,10 +1130,10 @@ void dllmain::main_tick()
                                             locked_trailers.push_back(trailer_actor);
                                         }
 
-                                        if (trailer_actor->steering + 0.01f > 1.f)
-                                            trailer_actor->steering = 1.f;
+                                        if (f_steering(trailer_actor) + 0.01f > 1.f)
+                                            f_steering(trailer_actor) = 1.f;
                                         else
-                                            trailer_actor->steering += 0.01f;
+                                            f_steering(trailer_actor) += 0.01f;
                                     }
                                 }
                             }
@@ -1004,7 +1152,7 @@ void dllmain::main_tick()
 
                                 if (steering_position <= 1.f && steering_position >= -1.f)
                                 {
-                                    trailer_actor->steering = steering_position;
+                                    f_steering(trailer_actor) = steering_position;
                                 }
                                 else
                                 {
@@ -1017,7 +1165,7 @@ void dllmain::main_tick()
                             break;
                         }
 
-                        trailer_actor = trailer_actor->slave;
+                        trailer_actor = f_slave(trailer_actor);
                         trailerIndex++;
                     }
                 }
@@ -1034,7 +1182,7 @@ void g_advance_steering_hook(prism::game_trailer_actor_u* vehicle_actor)
 {
     if (isTrailerLocked(vehicle_actor) || isTrailerTempLocked(vehicle_actor))
     {
-        prism::g_set_vehicle_steering(vehicle_actor->steering_data, vehicle_actor->steering);
+        prism::g_set_vehicle_steering(f_steerdata(vehicle_actor), f_steering(vehicle_actor));
         return;
     }
 
@@ -1047,6 +1195,82 @@ std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
         [](unsigned char c) { return std::tolower(c); });
     return s;
+}
+
+// 尝试用单个 profile 解析游戏内存布局。全部特征码命中才返回 true。
+// 成功时会填充 game_ctrl_ptr / game_actor_offset / prism::g_set_vehicle_steering
+// 以及挂车相关偏移，并设置 active_profile。
+static bool try_resolve_profile(const gamecfg::GameProfile& p, uintptr_t& out_advance_steering)
+{
+    // 1) game_ctrl 指针
+    uintptr_t instr = bmem::patternScan(p.sig_game_ctrl_ptr);
+    if (!bmem::isAddressValid(instr)) {
+        scs_log(0, "  [%s] miss: game_ctrl pointer signature not found", p.label);
+        return false;
+    }
+    uintptr_t ctrl_ptr = bmem::relativeToAbsolute(instr, p.game_ctrl_ptr_field, p.game_ctrl_ptr_instr_len);
+    if (!bmem::isAddressValid(ctrl_ptr)) {
+        scs_log(0, "  [%s] miss: game_ctrl pointer resolved out of module", p.label);
+        return false;
+    }
+
+    // 2) game_ctrl->game_actor 偏移（原代码缺少有效性检查，这里补上）
+    uintptr_t actor_off_instr = bmem::patternScan(p.sig_game_actor_offset);
+    if (!bmem::isAddressValid(actor_off_instr)) {
+        scs_log(0, "  [%s] miss: game_actor offset signature not found", p.label);
+        return false;
+    }
+    uint32_t actor_offset = *reinterpret_cast<uint32_t*>(actor_off_instr + p.game_actor_offset_field);
+
+    // 3) g_set_vehicle_steering
+    uintptr_t set_steering = bmem::patternScan(p.sig_set_vehicle_steering);
+    if (!bmem::isAddressValid(set_steering)) {
+        scs_log(0, "  [%s] miss: g_set_vehicle_steering signature not found", p.label);
+        return false;
+    }
+
+    // 4) g_advance_steering（核心 Hook 点）
+    uintptr_t advance_steering = bmem::patternScan(p.sig_advance_steering);
+    if (!bmem::isAddressValid(advance_steering)) {
+        scs_log(0, "  [%s] miss: g_advance_steering signature not found", p.label);
+        return false;
+    }
+
+    // 全部命中：提交解析结果
+    game_ctrl_ptr = ctrl_ptr;
+    game_actor_offset = actor_offset;
+    trailer_actor_offset = p.trailer_actor_offset;
+    trailer_actor_offset_render = p.trailer_actor_offset_render;
+    off_steering = p.off_trailer_steering;
+    off_steering_data = p.off_trailer_steering_data;
+    off_hook_joint = p.off_trailer_hook_joint;
+    off_slave = p.off_trailer_slave;
+    prism::g_set_vehicle_steering = (prism::g_set_vehicle_steering_t)set_steering;
+    out_advance_steering = advance_steering;
+    active_profile = &p;
+
+    scs_log(0, "Matched game profile: %s", p.label);
+    scs_log(0, "  game_ctrl pointer:            %p", game_ctrl_ptr);
+    scs_log(0, "  game_ctrl->game_actor offset: %d", game_actor_offset);
+    scs_log(0, "  g_set_vehicle_steering:       %p", set_steering);
+    scs_log(0, "  g_advance_steering:           %p", advance_steering);
+    return true;
+}
+
+// 按 game_id 过滤并逐一尝试所有 profile，命中第一个即为当前游戏版本布局。
+static bool resolve_game_layout(const char* game_id, uintptr_t& out_advance_steering)
+{
+    int tried = 0;
+    for (const auto& p : gamecfg::profiles()) {
+        if (!gamecfg::matches_game(p, game_id)) continue;
+        ++tried;
+        scs_log(0, "Trying game profile: %s (game_id=%s)",
+            p.label, game_id ? game_id : "unknown");
+        if (try_resolve_profile(p, out_advance_steering)) return true;
+    }
+    scs_log(2, "No compatible game profile matched (tried %d). "
+        "The game version may be unsupported; add a new profile in game_profiles.h.", tried);
+    return false;
 }
 
 #pragma comment( linker, "/export:scs_telemetry_init=scs_telemetry_init" )
@@ -1125,52 +1349,24 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 
     scs_log(0, "Hooked!");
 
-    uintptr_t game_ctrl_ptr_instruction = bmem::patternScan("48 8B 0D ?? ?? ?? ?? 0F 57 C0 48 8B D0");
-    if (!bmem::isAddressValid(game_ctrl_ptr_instruction))
+    // 解析游戏内存布局：按 game_id 自动匹配已知版本 profile（见 game_profiles.h）。
+    // 以后适配新游戏版本，只需在 game_profiles.h 增加一条 profile，无需改动此处。
+    const char* game_id = nullptr;
+    if (params) {
+        const auto* vparams = reinterpret_cast<const scs_telemetry_init_params_v101_t*>(params);
+        game_id = vparams->common.game_id;
+        scs_log(0, "Game: %s (api version %u.%u)",
+            game_id ? game_id : "unknown",
+            SCS_GET_MAJOR_VERSION(version), SCS_GET_MINOR_VERSION(version));
+    }
+
+    uintptr_t advance_steering_address = 0;
+    if (!resolve_game_layout(game_id, advance_steering_address))
     {
-        scs_log(2, "Failed to find the game_ctrl pointer instruction!");
-
         is_fatal_error = true;
-        error = "Failed to find the game_ctrl pointer instruction!";
-
+        error = "No compatible game version profile matched. Game version may be unsupported.";
         return SCS_RESULT_ok;
     }
-    game_ctrl_ptr = bmem::relativeToAbsolute(game_ctrl_ptr_instruction, 3, 7);
-    scs_log(0, "Found pointer to 'prism::game_ctrl' at: %p", game_ctrl_ptr);
-
-
-    uintptr_t game_actor_offset_instruction = bmem::patternScan("4C 8B 81 ?? ?? ?? ?? 48 8B DA 4C 8B F1");
-    game_actor_offset = *reinterpret_cast<uint32_t*>(game_actor_offset_instruction + 3);
-    scs_log(0, "Found 'game_ctrl->game_actor' offset ('%d')", game_actor_offset);
-    scs_log(0, "Found pointer to 'prism::game_actor' at: %p", *(uint8_t**)game_ctrl_ptr + game_actor_offset);
-
-
-
-    uintptr_t set_vehicle_steering_address = bmem::patternScan("48 89 5C 24 08 48 89 74 24 10 57 48 83 EC ?? 8B 41 ?? 48 8B D9 0F 29 74");
-    if (!bmem::isAddressValid(set_vehicle_steering_address))
-    {
-        scs_log(2, "Failed to find the 'prism::g_set_vehicle_steering' function!");
-
-        is_fatal_error = true;
-        error = "Failed to find the 'prism::g_set_vehicle_steering' function!";
-
-        return SCS_RESULT_ok;
-    }
-    scs_log(0, "Found 'prism::g_set_vehicle_steering' at: %p", set_vehicle_steering_address);
-    prism::g_set_vehicle_steering = (prism::g_set_vehicle_steering_t)set_vehicle_steering_address;
-
-
-    uintptr_t advance_steering_address = bmem::patternScan("40 55 53 56 48 8D AC 24 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 48 8B 91");
-    if (!bmem::isAddressValid(advance_steering_address))
-    {
-        scs_log(2, "Failed to find the 'prism::g_advance_steering' function!");
-
-        is_fatal_error = true;
-        error = "Failed to find the 'prism::g_advance_steering' function!";
-
-        return SCS_RESULT_ok;
-    }
-    scs_log(0, "Found 'prism::g_advance_steering' at: %p", advance_steering_address);
 
     bmem::MH_Success(MH_CreateHook((LPVOID)advance_steering_address, g_advance_steering_hook, (LPVOID*)&g_advance_steering_original));
     bmem::MH_Success(MH_EnableHook((LPVOID)advance_steering_address));
@@ -1178,8 +1374,15 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
     dinput_manager::InitDirectInput();
     for (auto& device : dinput_manager::GetInputDevices())
     {
+        // 正确地将 UTF-16 设备名转为 UTF-8（逐字符拷贝会截断宽字符并触发 C4244）
         std::wstring wstr(device.info.tszInstanceName);
-        std::string str(wstr.begin(), wstr.end());
+        int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
+                                      nullptr, 0, nullptr, nullptr);
+        std::string str(len ? (size_t)len : 0, '\0');
+        if (len) {
+            WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
+                                &str[0], len, nullptr, nullptr);
+        }
 
         input_device inputdevice;
         inputdevice.name = str;
@@ -1188,6 +1391,16 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
         scs_log(0, "Added input device '%s'", str.c_str());
 
         input_devices.emplace_back(inputdevice);
+    }
+
+    // 加入一个虚拟键盘设备（用 GetAsyncKeyState 检测，不依赖 DirectInput 枚举）
+    {
+        input_device keyboard;
+        keyboard.name = "Keyboard";
+        keyboard.di8_device = nullptr;
+        keyboard.is_keyboard = true;
+        input_devices.emplace_back(keyboard);
+        scs_log(0, "Added input device 'Keyboard'");
     }
 
     scs_log(0, "Reading settings...");
@@ -1206,6 +1419,7 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
         steer_button_device_index       = settings["steer_button_device_index"];
         steer_left_button_name          = settings["steer_left_button_name"];
         steer_right_button_name         = settings["steer_right_button_name"];
+        toggle_lock_button_name         = settings.value("toggle_lock_button_name", "None"); // 向后兼容旧配置
         current_controlled_trailer      = settings["current_controlled_trailer"];
         use_axis_steering               = settings["use_axis_steering"];
         use_button_steering             = settings["use_button_steering"];
@@ -1215,6 +1429,7 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
         last_steer_button_device_index  = steer_button_device_index;
         last_steer_left_button_name     = steer_left_button_name;
         last_steer_right_button_name    = steer_right_button_name;
+        last_toggle_lock_button_name    = toggle_lock_button_name;
         last_current_controlled_trailer = current_controlled_trailer;
         last_use_axis_steering          = use_axis_steering;
         last_use_button_steering        = use_button_steering;

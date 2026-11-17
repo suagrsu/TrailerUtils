@@ -1,4 +1,4 @@
-#include "rendering.h"
+﻿#include "rendering.h"
 #include "imgui/impl/win32_impl.h"
 
 kiero::RenderType::Enum RenderManager::DetectRenderDevice()
@@ -6,6 +6,22 @@ kiero::RenderType::Enum RenderManager::DetectRenderDevice()
     HMODULE TruckersMP = GetModuleHandleA("core_ets2mp.dll");
     if (TruckersMP) {
         return kiero::RenderType::D3D11;
+    }
+
+    // 注意：不要把 opengl32.dll 当作"游戏在用 OpenGL"的依据。
+    // opengl32.dll 是 Windows 系统库，几乎总会被加载进进程，
+    // 原实现把它放在 d3d11 检测之前，导致 ETS2/ATS（默认 D3D11）
+    // 被误判成 OpenGL，菜单 hook 错渲染 API 而不显示。
+    // 正确的做法是按"游戏实际用于绘制的 API"判断，D3D11 优先。
+
+    HMODULE d3d11 = GetModuleHandleA("d3d11.dll");
+    if (d3d11) {
+        return kiero::RenderType::D3D11;
+    }
+
+    HMODULE d3d12core = GetModuleHandleA("d3d12core.dll");
+    if (d3d12core) {
+        return kiero::RenderType::D3D12;
     }
 
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
@@ -16,11 +32,6 @@ kiero::RenderType::Enum RenderManager::DetectRenderDevice()
     HMODULE opengl = GetModuleHandleA("opengl32.dll");
     if (opengl) {
         return kiero::RenderType::OpenGL;
-    }
-
-    HMODULE d3d12core = GetModuleHandleA("d3d12core.dll");
-    if (d3d12core) {
-        return kiero::RenderType::D3D12;
     }
 
     return kiero::RenderType::D3D11;
