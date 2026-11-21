@@ -33,6 +33,8 @@ ETS2-TrailerUtil 是《欧洲卡车模拟 2》(ETS2) 和《美国卡车模拟》
 | 游戏版本 | 状态 |
 |---|---|
 | ETS2 / ATS 1.62 | ✅ 支持（已实测） |
+| ETS2 / ATS 1.61 | ✅ 支持（已实测） |
+| ETS2 / ATS 1.60 | ✅ 支持（已实测） |
 
 插件启动时会扫描游戏的 AOB 特征码，自动识别游戏版本并套用对应的内存偏移。适配原理、偏移表和后续版本适配方法见 [适配说明.md](适配说明.md)。
 
@@ -107,6 +109,8 @@ ETS2-TrailerUtil is a plugin for **Euro Truck Simulator 2** and **American Truck
 | Game version | Status |
 |---|---|
 | ETS2 / ATS 1.62 | ✅ Supported (tested) |
+| ETS2 / ATS 1.61 | ✅ Supported (tested) |
+| ETS2 / ATS 1.60 | ✅ Supported (tested) |
 
 At startup the plugin scans for known AOB signatures, detects the game version, and applies the matching memory offsets automatically. See [适配说明.md](适配说明.md) for the adaptation details, offset tables, and how to support future versions.
 
