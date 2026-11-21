@@ -110,7 +110,39 @@ namespace gamecfg
                 0x1058 // off_trailer_slave          [推断: hook 0xFB0 + 0xA8]
             },
 
+            // ---- ETS2 1.61（2026-11 逆向 + 游戏内实测通过）----
+            // 依据（D:/1/eurotrucks2.exe，ETS2 1.61）：
+            //   [确认] 前三条特征码在 1.61 exe 中唯一命中；game_actor 偏移 0x31B0（日志 12720）。
+            //   [确认] g_advance_steering = RVA 0x78EE10，从 setter 的 5 个调用点用 .pdata 定位；
+            //          新特征码唯一命中。1.62 的旧特征码 0 命中（cmp [rcx+0xFA9] 变为 +0xFD9）。
+            //   [确认] steering 0x6B8：movss [rsi+0x6B8], xmm2（写入指令，铁证）。
+            //   [确认] steering_data 0x6C0：mov rax,[rcx+0x6C0] 后传入 setter（铁证）。
+            //   [确认] hook_joint 0xFE0：[[rsi+0xFE0]] -> call [vtable+0xE0]（1.62 为 0xFB0，+0x30）。
+            //   [确认] slave 0x1088：hook_joint + 0xA8，静态推断后经游戏内实测（挂车列表/点击正常）。
+            //   [确认] trailer_actor_offset(_render) 0xC8：1.60/1.62 渲染链均为 0xC8，
+            //          1.61 实测按键转向生效，证明渲染/按键/hook 三者同址。
+            {
+                "ETS2 1.61",
+                nullptr, // 先按通用处理；实测与 ATS 1.61 布局不同再拆成两条
+                "48 8B 0D ?? ?? ?? ?? 0F 57 C0 48 8B D0",
+                "4C 8B 81 ?? ?? ?? ?? 48 8B DA 4C 8B F1",
+                "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC ?? 8B 41 ?? 48 8B D9 0F 29 74",
+                "48 8B C4 55 53 56 48 8D A8 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 80 B9 D9 0F 00 00 00 48 8B F1",
+                3,    // game_ctrl_ptr_field
+                7,    // game_ctrl_ptr_instr_len
+                3,    // game_actor_offset_field
+                0xC8, // trailer_actor_offset        [实测通过]
+                0xC8, // trailer_actor_offset_render  [实测通过]
+                0x6B8, // off_trailer_steering       [确认]
+                0x6C0, // off_trailer_steering_data  [确认]
+                0xFE0, // off_trailer_hook_joint     [确认 +0x30 vs 1.62]
+                0x1088 // off_trailer_slave          [实测通过: hook 0xFE0 + 0xA8]
+            },
+
             // ---- ETS2/ATS 1.60（旧版本 fallback，来自 "1.60 support" 提交）----
+            // 2026-11 修正：trailer_actor_offset 由 0xC0 改为 0xC8，与 1.62 的修复一致。
+            // 0xC0 指向的控制链对象与 hook/渲染收到的挂车对象不同，
+            // 导致「按键能绑定、拖动控制条有效，但按键无法转向」。
             {
                 "ETS2/ATS 1.60",
                 nullptr,
@@ -119,7 +151,7 @@ namespace gamecfg
                 "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC ?? 8B 41 ?? 48 8B D9 0F 29 74",
                 "40 55 53 56 48 8D AC 24 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 48 8B 91",
                 3, 7, 3,
-                0xC0, 0xC8,
+                0xC8, 0xC8, // trailer_actor_offset / _render：均为 0xC8，与 hook 对象同址
                 0x640, // off_trailer_steering
                 0x648, // off_trailer_steering_data
                 0xF68, // off_trailer_hook_joint
